@@ -1,0 +1,24 @@
+#!/bin/bash
+set -e
+
+gpu_ids="2"
+data_dir="../download_dataset/coco_val2017"
+ckpt="../checkpoints/v2-1_512-ema-pruned.ckpt"
+
+d_dd="code_sd"
+mkdir -p $d_dd
+cp -rf ../configs	$d_dd
+cp -rf ../scripts	$d_dd
+cp -rf ../ldm		$d_dd
+cp -rf ../*.py		$d_dd
+
+: <<'TTTTT'
+TTTTT
+pyshifeng -u $d_dd/scripts/txt2img_train_unet.py\
+	--todo               latent_gen		\
+	--seed               20240606		\
+	--data_dir           $data_dir		\
+	--batch_size         10			\
+	--ckpt               $ckpt		\
+	--gpu_ids            $gpu_ids
+
