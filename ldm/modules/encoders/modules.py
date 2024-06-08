@@ -208,9 +208,10 @@ class FrozenOpenCLIPEmbedder(AbstractEncoder):
         for param in self.parameters():
             param.requires_grad = False
 
-    def forward(self, text):
+    def forward(self, text, device=None):
+        dev = device or self.device
         tokens = open_clip.tokenize(text)
-        z = self.encode_with_transformer(tokens.to(self.device))
+        z = self.encode_with_transformer(tokens.to(dev))
         return z
 
     def encode_with_transformer(self, text):
@@ -232,8 +233,8 @@ class FrozenOpenCLIPEmbedder(AbstractEncoder):
                 x = r(x, attn_mask=attn_mask)
         return x
 
-    def encode(self, text):
-        return self(text)
+    def encode(self, text, device=None):
+        return self(text, device)
 
 
 class FrozenOpenCLIPImageEmbedder(AbstractEncoder):
