@@ -11,10 +11,14 @@ from ldm.modules.diffusionmodules.util import (
     conv_nd,
     linear,
     avg_pool_nd,
-    zero_module,
+    # zero_module,
     normalization,
     timestep_embedding,
 )
+def zero_module(module):
+    # mock up ldm.modules.diffusionmodules.util.zero_module. As we need to train UNetModel
+    return module
+
 from ldm.modules.attention import SpatialTransformer
 from ldm.util import exists
 
