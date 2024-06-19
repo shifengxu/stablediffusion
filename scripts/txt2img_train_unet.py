@@ -32,6 +32,9 @@ def parse_args():
     parser.add_argument("--save_ckpt_interval", type=int, default=50, help="count by epoch")
     parser.add_argument("--save_ckpt_eval", type=str2bool, default=False, help="Calculate FID when save ckpt")
     parser.add_argument("--noise_sss", type=int, default=100, help="noise selective set size")
+    parser.add_argument("--prompt_per_latent", type=str, default="n", help="1 or n")
+    parser.add_argument("--sample_output_dir", type=str, default="./generated")
+    parser.add_argument("--sample_count", type=int, default=50)
     parser.add_argument(
         "--prompt",
         type=str,

@@ -7,7 +7,7 @@ from torch import autocast, optim
 from ldm.util import instantiate_from_config
 from runner.ema import ExponentialMovingAverage
 from utils import log_info, get_time_ttl_and_eta
-from datasets import LatentPromptDataset
+from datasets import LatentPromptDataset, LatentPrompt1to1Dataset
 
 
 class DDIMTrainer:
@@ -48,6 +48,8 @@ class DDIMTrainer:
         log_info(f"  noise_select_opt1    : {self.noise_select_opt1}")
         self.batch_counter = None
         self.batch_total = None
+        self.eval_start_code_arr = []
+        self.dataset = None
 
         # to save memory, we can delete the model (which is LatentDiffusion)
         # and it can save 1.7G memory in each GPU.
@@ -161,7 +163,13 @@ class DDIMTrainer:
 
     def train(self):
         args, config, = self.args, self.config
-        ds = LatentPromptDataset(args.data_dir)
+        if args.prompt_per_latent == 'n':
+            ds = LatentPromptDataset(args.data_dir)
+        elif args.prompt_per_latent == '1':
+            ds = LatentPrompt1to1Dataset(args.data_dir)
+        else:
+            raise ValueError(f"Invalid args.prompt_per_latent: {args.prompt_per_latent}")
+        self.dataset = ds
         ltt_cnt = len(ds)
         batch_size = args.batch_size
         dl = tu_data.DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4)
@@ -194,8 +202,9 @@ class DDIMTrainer:
             #   Input type (c10::Half) and bias type (float) should be the same
             for e_idx in range(1, e_cnt + 1):  # Sampling
                 log_info(f"E{e_idx:3d}/{e_cnt} ------------------------ lr:{self.lr:}")
+                self.unet.train()
                 loss_cnt, loss_sum, do_sum, dn_sum = 0, 0.0, 0.0, 0.0
-                for b_idx, (ltt, pen, ltt_id) in enumerate(dl):
+                for b_idx, (ltt, pen, ltt_id, prompt_id) in enumerate(dl):
                     self.batch_counter += 1
                     ltt = ltt.to(args.device)
                     pen = pen.to(args.device)
@@ -216,7 +225,7 @@ class DDIMTrainer:
                         elp, eta = get_time_ttl_and_eta(time_start, self.batch_counter, self.batch_total)
                         msg = f"loss:{loss:.6f}, ema: {ema_decay:.6f}."
                         msg += f"dist:{dist_old:.6f}->{dist_new:.6f}. elp:{elp}, eta:{eta}"
-                        log_info(f"E{e_idx}.B{b_idx:3d}/{batch_cnt}. {msg}")
+                        log_info(f"E{e_idx}.B{b_idx:4d}/{batch_cnt}. {msg}")
                     del loss
                 # for batch
                 loss_avg = loss_sum / loss_cnt
@@ -226,7 +235,7 @@ class DDIMTrainer:
                          f"dist_old_avg:{dist_old_avg:.6f}, dist_new_avg:{dist_new_avg:.6f}")
                 if e_idx % save_itv == 0 or e_idx == e_cnt:
                     self.save_ckpt(e_idx)
-                    if save_eval: self.eval_ema()   # todo: evaluate after save
+                    if save_eval: self.eval_ema(e_idx)
             # for n_epochs
         # with
 
@@ -254,6 +263,57 @@ class DDIMTrainer:
         log_info(f"  epoch : {saved_state['epoch']}")
         torch.save(saved_state, ckpt_path)
         log_info(f"Save ckpt: {ckpt_path}...Done")
+
+    def eval_ema(self, epoch):
+        """generate images with EMA"""
+        from ldm.models.diffusion.ddim import DDIMSampler
+        import torchvision.utils as tvu
+
+        save_path = self.args.sample_output_dir
+        self.unet.eval()
+        if not os.path.exists(save_path):
+            log_info(f"os.makedirs({save_path})")
+            os.makedirs(save_path)
+        bs = self.args.batch_size
+        dl = tu_data.DataLoader(self.dataset, batch_size=bs, shuffle=False, num_workers=1)
+        sampler = DDIMSampler(self.model, device=self.device)
+        sample_count = self.args.sample_count
+        s_counter = 0
+        for b_idx, (ltt, pen, ltt_id, prompt_id) in enumerate(dl):
+            if s_counter >= sample_count: break
+            # sample and save
+            ltt, pen = ltt.to(self.device), pen.to(self.device)
+            uc = torch.cat([self.empty_prompt_encoding] * bs)
+            if b_idx >= len(self.eval_start_code_arr):
+                start_code = torch.randn_like(ltt, device=self.device)
+                self.eval_start_code_arr.append(start_code)
+                if b_idx == 0: log_info(f"E{epoch}: self.eval_start_code_arr.append(start_code)")
+            else:
+                start_code = self.eval_start_code_arr[b_idx]
+                if b_idx == 0: log_info(f"E{epoch}: start_code = self.eval_start_code_arr[{b_idx}]")
+            with torch.no_grad():
+                samples, _ = sampler.sample(S=20,
+                                            conditioning=pen,
+                                            batch_size=bs,
+                                            shape=self.shape,
+                                            verbose=False,
+                                            unconditional_guidance_scale=self.uc_guidance_scale,
+                                            unconditional_conditioning=uc,
+                                            eta=0.0,
+                                            x_T=start_code)
+            x_samples = self.model.decode_first_stage(samples)
+            x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+            f_path = None
+            for x, pid in zip(x_samples, prompt_id):
+                folder = os.path.join(save_path, f"{pid:06d}")
+                if not os.path.exists(folder):
+                    os.makedirs(folder)
+                f_path = os.path.join(folder, f"{pid:06d}_E{epoch:03d}.png")
+                tvu.save_image(x, f_path)
+                s_counter += 1
+            log_info(f"Saved {s_counter:2d}/{sample_count} images: {f_path}")
+        # for
+        self.unet.train()
 
     def calc_loss(self, latent, conditioning, unconditional_conditioning):
         batch_size = len(latent)

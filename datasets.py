@@ -121,8 +121,95 @@ class LatentPromptDataset(Dataset):
         pen_list = self.fns_pen_list[index] # prompt encoding list
         pen_len = len(pen_list)
         pen_idx = random.randint(0, pen_len - 1)    # randint() include both start and end
-        pen = np.load(os.path.join(self.pen_dir, pen_list[pen_idx]))
-        return ltt, pen, ltt_id
+        pen_fn = pen_list[pen_idx]  # pen file name, is like "000000581781_228278.npy"
+        pen = np.load(os.path.join(self.pen_dir, pen_fn))
+        stem, _ = pen_fn.split('.')
+        img_id, prompt_id = stem.split('_')
+        prompt_id = int(prompt_id)
+        return ltt, pen, ltt_id, prompt_id
+
+    def __len__(self):
+        return len(self.fns_list)
+
+class LatentPrompt1to1Dataset(Dataset):
+    def __init__(self, data_dir, data_limit=0):
+        # data_dir is like: ./download_dataset/coco_val2017_ltt
+        self.data_dir = data_dir
+        self.data_limit = data_limit
+        if not os.path.exists(data_dir):
+            raise ValueError(f"Path not exist: {data_dir}")
+        if not os.path.isdir(data_dir):
+            raise ValueError(f"Path not dir: {data_dir}")
+        fn_list = os.listdir(data_dir)  # file name list: ['00001.npy', '00002.npy', '00003.npy']
+        fns_list = [f[:-4] for f in fn_list if f.endswith('.npy')]
+        # file name stem list: ['00001', '00002', '00003']
+        fns_list.sort()
+        log_info(f"LatentPrompt1to1Dataset()...")
+        log_info(f"  data_dir   : {data_dir}")
+        log_info(f"  file cnt   : {len(fns_list)}")
+        log_info(f"  file[0]    : {fns_list[0]}")
+        log_info(f"  file[-1]   : {fns_list[-1]}")
+        log_info(f"  data_limit : {data_limit}")
+        if data_limit > 0:
+            fns_list = fns_list[:data_limit]
+        log_info(f"  train      : {len(fns_list)}")
+        log_info(f"  train[0]   : {fns_list[0]}")
+        log_info(f"  train[-1]  : {fns_list[-1]}")
+        self.fns_list = fns_list
+
+        # data dir: ./download_dataset/coco_val2017_ltt
+        # pen dir : ./download_dataset/coco_val2017_prompt_encode
+        parent_folder, dir_name = os.path.split(data_dir)
+        dir_name = dir_name[:-4]
+        pen_dir_name = f"{dir_name}_prompt_encode"
+        pen_path = os.path.join(parent_folder, pen_dir_name)    # ./download_dataset/coco_val2017_prompt_encode
+        self.pen_dir = pen_path
+        log_info(f"  pen_path   : {self.pen_dir}")
+        if not os.path.exists(pen_path):
+            raise ValueError(f"prompt encoding dir not found: {pen_path}")
+        pen_list = os.listdir(pen_path) # prompt encoding file list
+        pen_list.sort()
+        log_info(f"  found prompt: {len(pen_list)}")
+
+        ltt_pen_map = {}
+        for pen_fn in pen_list:
+            # pen file name is like "000000581781_228278.npy". Its first 12 character is img id
+            tmp, _ = pen_fn.split('.')
+            ltt, pen = tmp.split('_')
+            if ltt not in ltt_pen_map:
+                ltt_pen_map[ltt] = pen_fn
+        # for
+        self.ltt_pen_map = ltt_pen_map
+        log_info(f"  ltt_pen_map : {len(ltt_pen_map)}")
+        assert len(self.fns_list) == len(self.ltt_pen_map), f"prompt files should match all latent files."
+        for fns in self.fns_list:
+            assert fns in self.ltt_pen_map, f"{fns} should in ltt_pen_map"
+        f_path = "./latent_prompt_in_training.txt"
+        with open(f_path, 'w') as fptr:
+            fptr.write(f"# From: LatentPrompt1to1Dataset\n")
+            fptr.write(f"# size: {len(self.ltt_pen_map)} \n")
+            fptr.write(F"# host: {os.uname().nodename}")
+            fptr.write(F"# cwd : {os.getcwd()}")
+            fptr.write(F"# pid : {os.getpid()}")
+            fptr.write(f"# latent         : {self.data_dir} \n")
+            fptr.write(f"# prompt encoding: {self.pen_dir} \n")
+            fptr.write(f"\n")
+            fptr.write(f"# latent    : prompt encoding \n")
+            [fptr.write(f"{ltt}: {pen}\n") for ltt, pen in self.ltt_pen_map.items()]
+        log_info(f"  Saved: {f_path}")
+        log_info(f"LatentPrompt1to1Dataset()...Done")
+
+    def __getitem__(self, index):
+        fns = self.fns_list[index] # file name step is like: '00001', '00002', '00003'
+        ltt_id = int(fns)
+        ltt = np.load(os.path.join(self.data_dir, f"{fns}.npy"))
+        pen_fn = self.ltt_pen_map[fns]
+        # pen file name is like "000000581781_228278.npy". Its first 12 character is img id
+        pen = np.load(os.path.join(self.pen_dir, pen_fn))
+        stem, _ = pen_fn.split('.')
+        img_id, prompt_id = stem.split('_')
+        prompt_id = int(prompt_id)
+        return ltt, pen, ltt_id, prompt_id
 
     def __len__(self):
         return len(self.fns_list)
