@@ -20,6 +20,10 @@ class DDIMLatentGenerator:
         self.device   = opt.device
         self.data_dir = opt.data_dir
         self.model = None # model is LatentDiffusion
+        # For COCO2017, the data folder structure is like:
+        #   ./download_dataset/coco_val2017/
+        #   ./download_dataset/coco_val2017_captions.json
+        # and the args.data_dir is: "./download_dataset/coco_val2017"
         parent_folder, data_folder = os.path.split(self.data_dir)
         self.parent_folder, self.data_folder = parent_folder, data_folder
         log_info(f"data_dir : {self.data_dir}")
@@ -62,7 +66,9 @@ class DDIMLatentGenerator:
         # the JSON file name is tricky. But now let's do it in this way.
         json_file_path = os.path.join(parent_folder, json_file_name)
         if not os.path.exists(json_file_path):
-            raise ValueError(f"File not exist: {json_file_path}")
+            log_info(f"!!! Prompt JSON file not exist: {json_file_path}")
+            log_info(f"DDIMLatentGenerator::encode_prompt()...Abort")
+            return
         log_info(f"Read : {json_file_path}")
         with open(json_file_path, 'r') as fptr:
             j_str = fptr.read()
@@ -126,6 +132,8 @@ class DDIMLatentGenerator:
         log_info(f"DDIMLatentGenerator::encode_image_to_latent()...")
         # image_size = config.model.params.first_stage_config.params.ddconfig.resolution
         data_dir = self.data_dir
+        if 'bedroom' in data_dir:
+            image_size = 256    # change image size for bedroom dataset
         log_info(f"image_size : {image_size}")
         log_info(f"data_dir   : {data_dir}")
 
