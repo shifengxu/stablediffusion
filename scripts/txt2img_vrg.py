@@ -42,11 +42,13 @@ def parse_args():
     parser.add_argument("--config", type=str, default=f"{prt_dir}/configs/stable-diffusion/v2-inference.yaml")
     parser.add_argument("--model", type=str, choices=['plms', 'dpm', 'ddim'], default="ddim")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--steps", type=int, default=10)
-    parser.add_argument("--sch_lp", type=float, default=0.01, help="scheduler learning-portion")
+    parser.add_argument("--steps_arr", type=int, nargs='+', default=[10])
+    parser.add_argument("--sch_lp_arr", type=float, nargs='+', default=[0.01], help='scheduler learning-portion')
+    parser.add_argument("--fid_input1", type=str, default="./datasets_for_training/sd_gen_bedroom_512x512")
     parser.add_argument("--n_samples", type=int, default=22)
     parser.add_argument("--s_batch_init_id", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=5)
+    parser.add_argument("--output_dir", type=str, default=".")
     # parser.add_argument("--prompt", type=str, default="a professional photograph of an astronaut riding a triceratops")
     parser.add_argument("--prompt", type=str, default="a bedroom with bright window")
     parser.add_argument("--H", type=int, default=512, help="image height, in pixel space")
@@ -100,8 +102,8 @@ def get_model_and_sampler(opt):
     # else:
     #     raise ValueError(f"Invalid model: {opt.model}")
     from runner.ddim_vrg import DDIMSamplerVrg
-    sampler = DDIMSamplerVrg(model, device=opt.device)
-    log_info(f"  sampler = DDIMSamplerVrg(model, device={opt.device})")
+    sampler = DDIMSamplerVrg(opt, model)
+    log_info(f"  sampler = DDIMSamplerVrg(opt, model)")
     log_info(f"get_model_and_sampler()...Done")
     return model, sampler
 
@@ -163,7 +165,7 @@ def sample_or_regen(opt, model, sampler, img_old_dir, trajectory_file, img_new_d
     log_info(f"  n_samples  : {n_samples}")
     log_info(f"  batch_size : {batch_size}")
     log_info(f"  batch_cnt  : {batch_cnt}")
-    log_info(f"  opt.steps  : {opt.steps}")
+    log_info(f"  opt.steps_arr: {opt.steps_arr}")
     log_info(f"  opt.C      : {opt.C}")
     log_info(f"  opt.H      : {opt.H}")
     log_info(f"  opt.W      : {opt.W}")
@@ -175,12 +177,12 @@ def sample_or_regen(opt, model, sampler, img_old_dir, trajectory_file, img_new_d
     shape = [opt.C, latent_h, latent_w]
 
     def sample_batch_new(_ts, _c, _uc, _noise, _dir, _init_idx):
-        samples, _ = sampler.sample2(S=opt.steps,
-                                     ts_list_desc=_ts,
-                                     conditioning=_c,
-                                     unconditional_conditioning=_uc,
-                                     unconditional_guidance_scale=opt.scale,
-                                     x_T=_noise)
+        samples, _ = sampler.sample2_batch(S=opt.steps_arr[0],
+                                           ts_list_desc=_ts,
+                                           conditioning=_c,
+                                           unconditional_conditioning=_uc,
+                                           unconditional_guidance_scale=opt.scale,
+                                           x_T=_noise)
 
         x_samples = model.decode_first_stage(samples)
         x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
@@ -199,14 +201,14 @@ def sample_or_regen(opt, model, sampler, img_old_dir, trajectory_file, img_new_d
         log_info(f"  Saved {len(x_samples)}: {path}")
 
     def sample_batch_old(_c, _uc, _noise, _dir, _init_idx):
-        samples, _ = sampler.sample(S=opt.steps,
-                                    conditioning=_c,
-                                    batch_size=len(_noise),
-                                    shape=shape,
-                                    verbose=False,
-                                    unconditional_guidance_scale=opt.scale,
-                                    unconditional_conditioning=_uc,
-                                    x_T=_noise)
+        samples, _ = sampler.sample_batch(S=opt.steps_arr[0],
+                                          conditioning=_c,
+                                          batch_size=len(_noise),
+                                          shape=shape,
+                                          verbose=False,
+                                          unconditional_guidance_scale=opt.scale,
+                                          unconditional_conditioning=_uc,
+                                          x_T=_noise)
 
         x_samples = model.decode_first_stage(samples)
         x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
@@ -247,8 +249,8 @@ def merge(opt, dir1, dir2, dir_merge, label1=None, label2=None):
     log_info(f"  dir_merge: {dir_merge}")
     import cv2
     os.makedirs(dir_merge, exist_ok=True)
-    label1 = label1 or f"{opt.steps} steps: Old"
-    label2 = label2 or f"{opt.steps} steps: New"
+    label1 = label1 or f"{opt.steps_arr[0]} steps: Old"
+    label2 = label2 or f"{opt.steps_arr[0]} steps: New"
     f_list = os.listdir(dir1)
     f_list.sort()  # file name list
     font_face, font_scale = 0, 0.7
@@ -265,12 +267,10 @@ def merge(opt, dir1, dir2, dir_merge, label1=None, label2=None):
         log_info(f"  saved: {f3}")
     log_info(f"merge()...Done")
 
-def main():
-    opt = parse_args()
-    seed_everything(opt.seed)
-    log_info(f"opt:{opt}")
-    steps = opt.steps
-    root_dir = f"./vrg_steps{steps:02d}_lp{opt.sch_lp:.4f}"
+def instance_gen_compare(opt):
+    steps = opt.steps_arr[0]
+    root_dir = opt.output_dir or f"./vrg_steps{steps:02d}_lp{opt.sch_lp_arr[0]:.4f}"
+    log_info(f"root_dir: {root_dir}")
     os.makedirs(root_dir, exist_ok=True)
     file_old_trajectory = os.path.join(root_dir, f"ddim_steps{steps:02d}_trajectory_old.txt")
     file_new_trajectory = os.path.join(root_dir, f"ddim_steps{steps:02d}_trajectory_scheduled.txt")
@@ -303,6 +303,19 @@ def main():
 
     if 'merge' in opt.todo:         # merge images by old and new trajectories
         merge(opt, img_old_dir, img_new_dir, img_merge_dir)
+
+def main():
+    opt = parse_args()
+    seed_everything(opt.seed)
+    log_info(f"seed:{opt.seed}")
+    log_info(f"opt:{opt}")
+    log_info(f"txt2img_vrg -> todo: {opt.todo} ==================")
+    if opt.todo == 'sample_compare_all':
+        model, sampler = get_model_and_sampler(opt)
+        sampler.sample_compare_all()
+    else:
+        instance_gen_compare(opt)
+
 
 if __name__ == "__main__":
     main()

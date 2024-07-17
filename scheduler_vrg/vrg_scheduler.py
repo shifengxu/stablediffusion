@@ -148,8 +148,8 @@ class VrgScheduler:
         self.wt_arr = load_floats(weight_file)
         self.vs = VarianceSimulator(alpha_bar_list, self.wt_arr)
         self.vs.to(args.device)
-        self.lr             = 0.000001      # learning-rate
-        self.lp             = args.sch_lp   # learning_portion
+        self.lr             = 0.000001              # learning-rate
+        self.lp             = args.sch_lp_arr[0]    # learning_portion
         self.n_epochs       = 1000
         self.aa_low         = 0.0001
         self.aa_low_lambda  = 1e6
