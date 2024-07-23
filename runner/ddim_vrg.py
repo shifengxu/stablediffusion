@@ -63,7 +63,7 @@ class DDIMSamplerVrg(object):
 
         # generate samples with old trajectory
         for steps in args.steps_arr:
-            self.sample_by_vanilla(img_gen_dir)
+            self.sample_by_vanilla(steps, img_gen_dir)
             fid = calc_fid(gpu, True, args.fid_input1, img_gen_dir)
             result_arr.append(f"{steps:7d} \t vanilla \t {fid:7.3f}")
             save_result_arr()
@@ -73,17 +73,17 @@ class DDIMSamplerVrg(object):
             self.track_current_trajectory(steps, old_tj_file)
             for lp in args.sch_lp_arr:
                 # schedule the current trajectory with lp, and make new trajectory
-                new_tj_file = os.path.join(output_dir, f"ddim_steps{steps:02d}_trajectory_scheduled_lp{lp:.3f}.txt")
+                new_tj_file = os.path.join(output_dir, f"ddim_steps{steps:02d}_trajectory_scheduled_lp{lp:.5f}.txt")
                 self.schedule_trajectory_by_vrg(old_tj_file, new_tj_file)
                 self.sample_by_trajectory(new_tj_file, img_gen_dir)
                 fid = calc_fid(gpu, True, args.fid_input1, img_gen_dir)
-                result_arr.append(f"{steps:7d} \t {lp:7.3f} \t {fid:7.3f}")
+                result_arr.append(f"{steps:7d} \t {lp:.5f} \t {fid:7.3f}")
                 save_result_arr()
             # for lp
         # for steps
         log_info(f"DDIMSamplerVrg::sample_compare_all()...Done")
 
-    def sample_by_vanilla(self, img_gen_dir):
+    def sample_by_vanilla(self, steps, img_gen_dir):
         """sample by vanilla approach, which uses original trajectory"""
         from torch import autocast
         from PIL import Image
@@ -91,6 +91,7 @@ class DDIMSamplerVrg(object):
 
         args = self.args
         log_info(f"DDIMSamplerVrg::sample_by_vanilla()...")
+        log_info(f"  steps       : {steps}")
         log_info(f"  img_gen_dir : {img_gen_dir}")
 
         n_samples = args.n_samples
@@ -113,11 +114,9 @@ class DDIMSamplerVrg(object):
 
 
         def sample_by_vanilla_batch(_c, _uc, _noise, _init_idx):
-            samples, _ = self.sample_batch(S=args.steps_arr[0],
-                                           conditioning=_c,
+            samples, _ = self.sample_batch(conditioning=_c,
                                            batch_size=len(_noise),
                                            shape=shape,
-                                           verbose=False,
                                            unconditional_guidance_scale=args.scale,
                                            unconditional_conditioning=_uc,
                                            x_T=_noise)
@@ -138,6 +137,7 @@ class DDIMSamplerVrg(object):
                 _init_idx += 1
             log_info(f"  Saved {len(x_samples)}: {path}")
 
+        self.make_alphas_cumprod(ddim_num_steps=steps, verbose=False)
         with torch.no_grad(), autocast(args.device), self.model.ema_scope():
             for b_idx in range(0, batch_cnt):
                 n = batch_size if b_idx < batch_cnt - 1 else n_samples - b_idx * batch_size
@@ -180,7 +180,6 @@ class DDIMSamplerVrg(object):
         log_info(f"  prompt         : {args.prompt}")
         ab_arr, ts_arr = load_trajectory()  # alpha_bar array
         ts_arr_desc = list(reversed(ts_arr))
-        step_count = len(ab_arr)
         log_info(f"  ab_arr len: {len(ab_arr)}")
         log_info(f"  ab_arr[0] : {ab_arr[0]:.6f}  {ts_arr[0]:3d}")
         log_info(f"  ab_arr[1] : {ab_arr[1]:.6f}  {ts_arr[1]:3d}")
@@ -205,9 +204,8 @@ class DDIMSamplerVrg(object):
         log_info(f"  latent_h   : {latent_h}")
         log_info(f"  latent_w   : {latent_w}")
 
-        def sample_batch(_ts, _c, _uc, _noise):
-            samples, _ = self.sample2_batch(S=step_count,
-                                            ts_list_desc=_ts,
+        def sample_by_trajectory_batch(_ts, _c, _uc, _noise):
+            samples, _ = self.sample2_batch(ts_list_desc=_ts,
                                             conditioning=_c,
                                             unconditional_conditioning=_uc,
                                             unconditional_guidance_scale=args.scale,
@@ -231,6 +229,8 @@ class DDIMSamplerVrg(object):
                 _init_idx += 1
             log_info(f"  Saved {len(_x_samples)}: {path}")
 
+        ts_tensor = torch.Tensor(ts_arr, device=self.device)
+        self.make_alphas_cumprod(ddim_num_steps=None, ddim_timesteps=ts_tensor, verbose=False)
         with torch.no_grad(), autocast(args.device), self.model.ema_scope():
             for b_idx in range(0, batch_cnt):
                 n = batch_size if b_idx < batch_cnt - 1 else n_samples - b_idx * batch_size
@@ -239,7 +239,7 @@ class DDIMSamplerVrg(object):
                 uc = None if args.scale == 1.0 else self.model.get_learned_conditioning(n * [""])
                 start_code = torch.randn([n, latent_c, latent_h, latent_w], device=args.device)
                 init_idx = b_idx * batch_size + args.s_batch_init_id
-                x_batch = sample_batch(ts_arr_desc, c, uc, start_code)
+                x_batch = sample_by_trajectory_batch(ts_arr_desc, c, uc, start_code)
                 save_batch(x_batch, init_idx)
             # for batch
         # with
@@ -259,9 +259,14 @@ class DDIMSamplerVrg(object):
                 attr = attr.to(self.device)
         setattr(self, name, attr)
 
-    def make_alphas_cumprod(self, ddim_num_steps, ddim_discretize="uniform", verbose=True):
-        self.ddim_timesteps = make_ddim_timesteps(ddim_discr_method=ddim_discretize, num_ddim_timesteps=ddim_num_steps,
-                                                  num_ddpm_timesteps=self.ddpm_num_timesteps, verbose=verbose)
+    def make_alphas_cumprod(self, ddim_num_steps, ddim_discretize="uniform", ddim_timesteps=None, verbose=True):
+        if ddim_timesteps:
+            self.ddim_timesteps = ddim_timesteps
+        else:
+            self.ddim_timesteps = make_ddim_timesteps(ddim_discr_method=ddim_discretize,
+                                                      num_ddim_timesteps=ddim_num_steps,
+                                                      num_ddpm_timesteps=self.ddpm_num_timesteps,
+                                                      verbose=verbose)
         alphas_cumprod = self.model.alphas_cumprod
         assert alphas_cumprod.shape[0] == self.ddpm_num_timesteps, 'alphas have to be defined for each timestep'
         to_torch = lambda x: x.clone().detach().to(torch.float32).to(self.model.device)
@@ -314,7 +319,6 @@ class DDIMSamplerVrg(object):
 
     @torch.no_grad()
     def sample_batch(self,
-                     S,
                      batch_size,
                      shape,
                      conditioning=None,
@@ -327,7 +331,6 @@ class DDIMSamplerVrg(object):
                      noise_dropout=0.,
                      score_corrector=None,
                      corrector_kwargs=None,
-                     verbose=True,
                      x_T=None,
                      log_every_t=100,
                      unconditional_guidance_scale=1.,
@@ -335,7 +338,6 @@ class DDIMSamplerVrg(object):
                      dynamic_threshold=None,
                      ucg_schedule=None,
                      ):
-        self.make_alphas_cumprod(ddim_num_steps=S, verbose=verbose)
         # sampling
         C, H, W = shape
         size = (batch_size, C, H, W)
@@ -364,7 +366,6 @@ class DDIMSamplerVrg(object):
 
     @torch.no_grad()
     def sample2_batch(self,
-                      S,
                       ts_list_desc,
                       conditioning=None,
                       img_callback=None,
@@ -382,13 +383,6 @@ class DDIMSamplerVrg(object):
                       dynamic_threshold=None,
                       ucg_schedule=None,
                       ):
-        # We have to use "S" (steps) here, and can not use len(ts_list_desc).
-        # Because when steps=6, the ts_list_desc will have 7 elements:
-        #   ts_list_desc = [997, 831, 665, 499, 333, 167, 1]
-        # the reason is, when generating the timestep list, it is:
-        #   c = num_ddpm_timesteps // num_ddim_timesteps
-        #   ddim_timesteps = np.asarray(list(range(0, num_ddpm_timesteps, c)))
-        self.make_alphas_cumprod(ddim_num_steps=S, verbose=False)
         img = x_T
         intermediates = {'x_inter': [img], 'pred_x0': [img]}
         # if steps is 20:
