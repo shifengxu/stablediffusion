@@ -260,13 +260,13 @@ class DDIMSamplerVrg(object):
         setattr(self, name, attr)
 
     def make_alphas_cumprod(self, ddim_num_steps, ddim_discretize="uniform", ddim_timesteps=None, verbose=True):
-        if ddim_timesteps:
-            self.ddim_timesteps = ddim_timesteps
-        else:
+        if ddim_timesteps is None:
             self.ddim_timesteps = make_ddim_timesteps(ddim_discr_method=ddim_discretize,
                                                       num_ddim_timesteps=ddim_num_steps,
                                                       num_ddpm_timesteps=self.ddpm_num_timesteps,
                                                       verbose=verbose)
+        else:
+            self.ddim_timesteps = ddim_timesteps
         alphas_cumprod = self.model.alphas_cumprod
         assert alphas_cumprod.shape[0] == self.ddpm_num_timesteps, 'alphas have to be defined for each timestep'
         to_torch = lambda x: x.clone().detach().to(torch.float32).to(self.model.device)
