@@ -229,7 +229,7 @@ class DDIMSamplerVrg(object):
                 _init_idx += 1
             log_info(f"  Saved {len(_x_samples)}: {path}")
 
-        ts_tensor = torch.Tensor(ts_arr, device=self.device)
+        ts_tensor = torch.Tensor(ts_arr)    # have to use device CPU, not GPU.
         self.make_alphas_cumprod(ddim_num_steps=None, ddim_timesteps=ts_tensor, verbose=False)
         with torch.no_grad(), autocast(args.device), self.model.ema_scope():
             for b_idx in range(0, batch_cnt):
