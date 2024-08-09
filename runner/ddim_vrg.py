@@ -17,6 +17,21 @@ class DDIMSamplerVrg(object):
         self.model = model
         self.ddpm_num_timesteps = model.num_timesteps
         self.device = args.device or torch.device("cuda")
+
+        alphas_cumprod = self.model.alphas_cumprod
+        assert alphas_cumprod.shape[0] == self.ddpm_num_timesteps, 'alphas have to be defined for each timestep'
+        to_torch = lambda x: x.clone().detach().to(torch.float32).to(self.model.device)
+        self.register_buffer('betas', to_torch(self.model.betas))
+        self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
+        self.register_buffer('alphas_cumprod_prev', to_torch(self.model.alphas_cumprod_prev))
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+        self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod.cpu())))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod.cpu())))
+        self.register_buffer('log_one_minus_alphas_cumprod', to_torch(np.log(1. - alphas_cumprod.cpu())))
+        self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod.cpu())))
+        self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod.cpu() - 1)))
+
         log_info(f"  device     : {self.device}")
         log_info(f"  model      : {type(self.model).__name__}")
         log_info(f"  ddpm_num_timesteps : {self.ddpm_num_timesteps}")
@@ -113,31 +128,16 @@ class DDIMSamplerVrg(object):
         log_info(f"  shape      : {shape}")
 
 
-        def sample_by_vanilla_batch(_c, _uc, _noise, _init_idx):
-            samples, _ = self.sample_batch(conditioning=_c,
-                                           batch_size=len(_noise),
-                                           shape=shape,
-                                           unconditional_guidance_scale=args.scale,
-                                           unconditional_conditioning=_uc,
-                                           x_T=_noise)
-
-            x_samples = self.model.decode_first_stage(samples)
-            x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
-            # if batch_size is 1, opt.f is 8, opt.H = opt.W = 512,
-            # then shape:    [4,  64,  64]
-            # sample    : [1, 4,  64,  64]
-            # x_samples : [1, 3, 512, 512]
-
+        def save_vanilla_batch(_x_samples, _init_idx):
             path = None
-            for x_sample in x_samples:
+            for x_sample in _x_samples:
                 x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
                 img = Image.fromarray(x_sample.astype(np.uint8))
                 path = os.path.join(img_gen_dir, f"{_init_idx:05}.png")
                 img.save(path)
                 _init_idx += 1
-            log_info(f"  Saved {len(x_samples)}: {path}")
+            log_info(f"  Saved {len(_x_samples)}: {path}")
 
-        self.make_alphas_cumprod(ddim_num_steps=steps, verbose=False)
         with torch.no_grad(), autocast(args.device), self.model.ema_scope():
             for b_idx in range(0, batch_cnt):
                 n = batch_size if b_idx < batch_cnt - 1 else n_samples - b_idx * batch_size
@@ -145,8 +145,19 @@ class DDIMSamplerVrg(object):
                 c = self.model.get_learned_conditioning(prompts)
                 uc = None if args.scale == 1.0 else self.model.get_learned_conditioning(n * [""])
                 start_code = torch.randn([n, latent_c, latent_h, latent_w], device=args.device)
+                is_first = b_idx == 0
+                samples, _ = self.sample_batch(S=steps,
+                                               conditioning=c,
+                                               batch_size=len(start_code),
+                                               shape=shape,
+                                               unconditional_guidance_scale=args.scale,
+                                               unconditional_conditioning=uc,
+                                               x_T=start_code,
+                                               make_alpha=is_first)
+                x_samples = self.model.decode_first_stage(samples)
+                x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
                 init_idx = b_idx * batch_size + args.s_batch_init_id
-                sample_by_vanilla_batch(c, uc, start_code, init_idx)
+                save_vanilla_batch(x_samples, init_idx)
             # for batch
         # with
         log_info(f"DDIMSamplerVrg::sample_by_vanilla()...Done")
@@ -204,21 +215,6 @@ class DDIMSamplerVrg(object):
         log_info(f"  latent_h   : {latent_h}")
         log_info(f"  latent_w   : {latent_w}")
 
-        def sample_by_trajectory_batch(_ts, _c, _uc, _noise):
-            samples, _ = self.sample2_batch(ts_list_desc=_ts,
-                                            conditioning=_c,
-                                            unconditional_conditioning=_uc,
-                                            unconditional_guidance_scale=args.scale,
-                                            x_T=_noise)
-
-            x_samples = self.model.decode_first_stage(samples)
-            x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
-            # if batch_size is 1, args.f is 8, args.H = args.W = 512,
-            # then shape:    [4,  64,  64]
-            # sample    : [1, 4,  64,  64]
-            # x_samples : [1, 3, 512, 512]
-            return x_samples
-
         def save_batch(_x_samples, _init_idx):
             path = None
             for x in _x_samples:
@@ -229,8 +225,6 @@ class DDIMSamplerVrg(object):
                 _init_idx += 1
             log_info(f"  Saved {len(_x_samples)}: {path}")
 
-        ts_tensor = torch.tensor(ts_arr, dtype=torch.long)    # have to use device CPU, not GPU.
-        self.make_alphas_cumprod(ddim_num_steps=None, ddim_timesteps=ts_tensor, verbose=False)
         with torch.no_grad(), autocast(args.device), self.model.ema_scope():
             for b_idx in range(0, batch_cnt):
                 n = batch_size if b_idx < batch_cnt - 1 else n_samples - b_idx * batch_size
@@ -238,8 +232,16 @@ class DDIMSamplerVrg(object):
                 c = self.model.get_learned_conditioning(prompts)
                 uc = None if args.scale == 1.0 else self.model.get_learned_conditioning(n * [""])
                 start_code = torch.randn([n, latent_c, latent_h, latent_w], device=args.device)
+                is_first = b_idx == 0
+                latent_samples, _ = self.sample2_batch(ts_list_desc=ts_arr_desc,
+                                                       conditioning=c,
+                                                       unconditional_conditioning=uc,
+                                                       unconditional_guidance_scale=args.scale,
+                                                       x_T=start_code,
+                                                       make_alphas=is_first)
+                x_batch = self.model.decode_first_stage(latent_samples)
+                x_batch = torch.clamp((x_batch + 1.0) / 2.0, min=0.0, max=1.0)
                 init_idx = b_idx * batch_size + args.s_batch_init_id
-                x_batch = sample_by_trajectory_batch(ts_arr_desc, c, uc, start_code)
                 save_batch(x_batch, init_idx)
             # for batch
         # with
@@ -268,32 +270,14 @@ class DDIMSamplerVrg(object):
         else:
             self.ddim_timesteps = ddim_timesteps
         alphas_cumprod = self.model.alphas_cumprod
-        assert alphas_cumprod.shape[0] == self.ddpm_num_timesteps, 'alphas have to be defined for each timestep'
-        to_torch = lambda x: x.clone().detach().to(torch.float32).to(self.model.device)
-
-        self.register_buffer('betas', to_torch(self.model.betas))
-        self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
-        self.register_buffer('alphas_cumprod_prev', to_torch(self.model.alphas_cumprod_prev))
-
-        # calculations for diffusion q(x_t | x_{t-1}) and others
-        self.register_buffer('sqrt_alphas_cumprod', to_torch(np.sqrt(alphas_cumprod.cpu())))
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', to_torch(np.sqrt(1. - alphas_cumprod.cpu())))
-        self.register_buffer('log_one_minus_alphas_cumprod', to_torch(np.log(1. - alphas_cumprod.cpu())))
-        self.register_buffer('sqrt_recip_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod.cpu())))
-        self.register_buffer('sqrt_recipm1_alphas_cumprod', to_torch(np.sqrt(1. / alphas_cumprod.cpu() - 1)))
 
         # ddim sampling parameters
-        ddim_sigmas, ddim_alphas, ddim_alphas_prev = make_ddim_sampling_parameters(alphacums=alphas_cumprod.cpu(),
-                                                                                   ddim_timesteps=self.ddim_timesteps,
-                                                                                   eta=0., verbose=verbose)
-        self.register_buffer('ddim_sigmas', ddim_sigmas)
+        _, ddim_alphas, ddim_alphas_prev = make_ddim_sampling_parameters(alphacums=alphas_cumprod.cpu(),
+                                                                         ddim_timesteps=self.ddim_timesteps,
+                                                                         eta=0., verbose=verbose)
         self.register_buffer('ddim_alphas', ddim_alphas)
         self.register_buffer('ddim_alphas_prev', ddim_alphas_prev)
         self.register_buffer('ddim_sqrt_one_minus_alphas', np.sqrt(1. - ddim_alphas))
-        sigmas_for_original_sampling_steps = 0. * torch.sqrt(
-            (1 - self.alphas_cumprod_prev) / (1 - self.alphas_cumprod) * (
-                        1 - self.alphas_cumprod / self.alphas_cumprod_prev))
-        self.register_buffer('ddim_sigmas_for_original_num_steps', sigmas_for_original_sampling_steps)
 
     def track_current_trajectory(self, steps, file_path):
         log_info(f"DDIMSamplerVrg::track_current_trajectory(steps={steps})...")
@@ -319,6 +303,7 @@ class DDIMSamplerVrg(object):
 
     @torch.no_grad()
     def sample_batch(self,
+                     S,
                      batch_size,
                      shape,
                      conditioning=None,
@@ -337,8 +322,11 @@ class DDIMSamplerVrg(object):
                      unconditional_conditioning=None,
                      dynamic_threshold=None,
                      ucg_schedule=None,
+                     make_alpha=True,
                      ):
         # sampling
+        if make_alpha:
+            self.make_alphas_cumprod(ddim_num_steps=S, verbose=False)
         C, H, W = shape
         size = (batch_size, C, H, W)
         if not hasattr(self, '_log_flag1_data_shape'):
@@ -382,7 +370,12 @@ class DDIMSamplerVrg(object):
                       unconditional_conditioning=None,
                       dynamic_threshold=None,
                       ucg_schedule=None,
+                      make_alpha=True,
                       ):
+        if make_alpha:
+            ts_arr = list(reversed(ts_list_desc))
+            ts_tensor = torch.tensor(ts_arr, dtype=torch.long)  # have to use device CPU, not GPU.
+            self.make_alphas_cumprod(ddim_num_steps=None, ddim_timesteps=ts_tensor, verbose=False)
         img = x_T
         intermediates = {'x_inter': [img], 'pred_x0': [img]}
         # if steps is 20:
@@ -533,14 +526,17 @@ class DDIMSamplerVrg(object):
             assert self.model.parameterization == "eps", 'not implemented'
             e_t = score_corrector.modify_score(self.model, e_t, x, t, c, **corrector_kwargs)
 
-        alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
-        alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
-        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
-        sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
+        if use_original_steps:
+            alphas                = self.model.alphas_cumprod
+            alphas_prev           = self.model.alphas_cumprod_prev
+            sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod
+        else:
+            alphas                = self.ddim_alphas
+            alphas_prev           = self.ddim_alphas_prev
+            sqrt_one_minus_alphas = self.ddim_sqrt_one_minus_alphas
         # select parameters corresponding to the currently considered timestep
-        a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
-        a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
-        sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
+        a_t               = torch.full((b, 1, 1, 1), alphas[index], device=device)
+        a_prev            = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
         sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index], device=device)
 
         # current prediction for x_0
@@ -556,9 +552,6 @@ class DDIMSamplerVrg(object):
             raise NotImplementedError()
 
         # direction pointing to x_t
-        dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
-        noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
-        if noise_dropout > 0.:
-            noise = torch.nn.functional.dropout(noise, p=noise_dropout)
-        x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
+        dir_xt = (1. - a_prev).sqrt() * e_t
+        x_prev = a_prev.sqrt() * pred_x0 + dir_xt
         return x_prev, pred_x0
