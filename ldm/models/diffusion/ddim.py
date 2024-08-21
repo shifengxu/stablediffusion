@@ -89,7 +89,7 @@ class DDIMSampler(object):
             elif isinstance(conditioning, list):
                 for ctmp in conditioning:
                     if ctmp.shape[0] != batch_size:
-                        print(f"Warning: Got {cbs} conditionings but batch-size is {batch_size}")
+                        print(f"Warning: Got {ctmp.shape[0]} conditionings but batch-size is {batch_size}")
 
             else:
                 if conditioning.shape[0] != batch_size:
@@ -99,7 +99,9 @@ class DDIMSampler(object):
         # sampling
         C, H, W = shape
         size = (batch_size, C, H, W)
-        print(f'Data shape for DDIM sampling is {size}, eta {eta}')
+        if not hasattr(self, '_log_flag1_data_shape'):
+            setattr(self, '_log_flag1_data_shape', True)
+            print(f'Data shape for DDIM sampling is {size}, eta {eta}')
 
         samples, intermediates = self.ddim_sampling(conditioning, size,
                                                     callback=callback,
@@ -144,12 +146,17 @@ class DDIMSampler(object):
         intermediates = {'x_inter': [img], 'pred_x0': [img]}
         time_range = reversed(range(0,timesteps)) if ddim_use_original_steps else np.flip(timesteps)
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
-        print(f"Running DDIM Sampling with {total_steps} timesteps")
+        # if steps is 20, ddim_use_original_steps is False:
+        # timesteps : [  1  51 101 151 201 251 301 351 401 451 501 551 601 651 701 751 801 851, 901 951]
+        # time_range: [951 901 851 801 751 701 651 601 551 501 451 401 351 301 251 201 151 101,  51   1]
 
-        iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+        if not hasattr(self, '_log_flag2_ts_num'):
+            setattr(self, '_log_flag2_ts_num', True)
+            print(f"Running DDIM Sampling with {total_steps} timesteps")
 
-        for i, step in enumerate(iterator):
+        for i, step in enumerate(time_range):
             index = total_steps - i - 1
+            # print(f"index:{index}; step:{step}")
             ts = torch.full((b,), step, device=device, dtype=torch.long)
 
             if mask is not None:

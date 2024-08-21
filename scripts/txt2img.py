@@ -1,17 +1,20 @@
 import argparse, os
+if not os.environ.get('CUDA_VISIBLE_DEVICES'):
+    gpu = '5'
+    os.environ['CUDA_VISIBLE_DEVICES'] = gpu
+    print(f"os.environ['CUDA_VISIBLE_DEVICES'] = '{gpu}'")
 import cv2
 import torch
 import numpy as np
 from omegaconf import OmegaConf
 from PIL import Image
-from tqdm import tqdm, trange
 from itertools import islice
 from einops import rearrange
 from torchvision.utils import make_grid
 from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import nullcontext
-from imwatermark import WatermarkEncoder
+# from imwatermark import WatermarkEncoder
 
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -97,8 +100,14 @@ def parse_args():
     parser.add_argument(
         "--n_iter",
         type=int,
-        default=3,
+        default=1,
         help="sample this often",
+    )
+    parser.add_argument(
+        "--noise_count",
+        type=int,
+        default=0,
+        help="used when compute the distance between noise and sample",
     )
     parser.add_argument(
         "--H",
@@ -127,7 +136,7 @@ def parse_args():
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=3,
+        default=1,
         help="how many samples to produce for each given prompt. A.k.a batch size",
     )
     parser.add_argument(
@@ -157,6 +166,7 @@ def parse_args():
         "--ckpt",
         type=str,
         help="path to checkpoint of model",
+        default="./checkpoints/v2-1_512-ema-pruned.ckpt",
     )
     parser.add_argument(
         "--seed",
@@ -182,7 +192,7 @@ def parse_args():
         type=str,
         help="Device on which Stable Diffusion will be run",
         choices=["cpu", "cuda"],
-        default="cpu"
+        default="cuda"
     )
     parser.add_argument(
         "--torchscript",
@@ -213,25 +223,37 @@ def put_watermark(img, wm_encoder=None):
 
 def main(opt):
     seed_everything(opt.seed)
+    print(f"opt:{opt}")
 
     config = OmegaConf.load(f"{opt.config}")
     device = torch.device("cuda") if opt.device == "cuda" else torch.device("cpu")
+    print(f"config: {config}")
+    print(f"device: {device}")
     model = load_model_from_config(config, f"{opt.ckpt}", device)
 
     if opt.plms:
         sampler = PLMSSampler(model, device=device)
+        print(f"sampler = PLMSSampler(model, device={device})")
     elif opt.dpm:
         sampler = DPMSolverSampler(model, device=device)
+        print(f"sampler = DPMSolverSampler(model, device={device})")
     else:
         sampler = DDIMSampler(model, device=device)
+        print(f"sampler = DDIMSampler(model, device={device})")
 
-    os.makedirs(opt.outdir, exist_ok=True)
-    outpath = opt.outdir
+    out_dir = opt.outdir
+    os.makedirs(out_dir, exist_ok=True)
+    sample_path = os.path.join(out_dir, "samples")
+    os.makedirs(sample_path, exist_ok=True)
+    print(f"out_dir    : {out_dir}")
+    print(f"sample_path: {sample_path}")
 
-    print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
-    wm = "SDV2"
-    wm_encoder = WatermarkEncoder()
-    wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
+    # print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
+    # wm = "SDV2"
+    # wm_encoder = WatermarkEncoder()
+    # wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
+    # print("Creating invisible watermark encoder ... Done")
+    wm_encoder = None
 
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
@@ -247,16 +269,26 @@ def main(opt):
             data = [p for p in data for i in range(opt.repeat)]
             data = list(chunk(data, batch_size))
 
-    sample_path = os.path.join(outpath, "samples")
-    os.makedirs(sample_path, exist_ok=True)
     sample_count = 0
     base_count = len(os.listdir(sample_path))
-    grid_count = len(os.listdir(outpath)) - 1
+    grid_count = len(os.listdir(out_dir)) - 1
+    print(f"batch_size: {batch_size}")
+    print(f"n_rows    : {n_rows}")
+    print(f"base_count: {base_count}")
+    print(f"grid_count: {grid_count}")
 
-    start_code = None
     if opt.fixed_code:
         start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
+        print(f"start_code : {start_code.size()}")
+        print(f"H          : {opt.H}")
+        print(f"W          : {opt.W}")
+        print(f"f          : {opt.f}")
+    else:
+        start_code = None
+        print(f"start_code : {start_code}")
 
+    print(f"torchscript: {opt.torchscript}")
+    print(f"ipex       : {opt.ipex}")
     if opt.torchscript or opt.ipex:
         transformer = model.cond_stage_model.model
         unet = model.model.diffusion_model
@@ -331,12 +363,14 @@ def main(opt):
                 x_samples_ddim = model.decode_first_stage(samples_ddim)
 
     precision_scope = autocast if opt.precision=="autocast" or opt.bf16 else nullcontext
+    check_noise_dist = opt.noise_count
+    numerator, denominator = 0, 0
     with torch.no_grad(), \
         precision_scope(opt.device), \
         model.ema_scope():
             all_samples = list()
-            for n in trange(opt.n_iter, desc="Sampling"):
-                for prompts in tqdm(data, desc="data"):
+            for n in range(opt.n_iter): # desc="Sampling"
+                for prompts in data:    # desc="data"
                     uc = None
                     if opt.scale != 1.0:
                         uc = model.get_learned_conditioning(batch_size * [""])
@@ -344,43 +378,83 @@ def main(opt):
                         prompts = list(prompts)
                     c = model.get_learned_conditioning(prompts)
                     shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                    if check_noise_dist:
+                        start_code = torch.randn((opt.n_samples, *shape), device=opt.device)
+                        old_noises = torch.randn((opt.n_samples, *shape), device=opt.device, requires_grad=False)
+                        old_noises[:] = start_code[:]
                     samples, _ = sampler.sample(S=opt.steps,
-                                                     conditioning=c,
-                                                     batch_size=opt.n_samples,
-                                                     shape=shape,
-                                                     verbose=False,
-                                                     unconditional_guidance_scale=opt.scale,
-                                                     unconditional_conditioning=uc,
-                                                     eta=opt.ddim_eta,
-                                                     x_T=start_code)
+                                                 conditioning=c,
+                                                 batch_size=opt.n_samples,
+                                                 shape=shape,
+                                                 verbose=False,
+                                                 unconditional_guidance_scale=opt.scale,
+                                                 unconditional_conditioning=uc,
+                                                 eta=opt.ddim_eta,
+                                                 x_T=start_code)
+
+                    if check_noise_dist:
+                        for n_idx in range(len(old_noises)):
+                            noise = old_noises[n_idx:n_idx+1]
+                            sample = samples[n_idx:n_idx+1]
+                            new_noises = torch.randn((check_noise_dist, *shape), device=opt.device)
+                            new_noises[1, :] = noise[0, :]
+                            dist_arr = (new_noises - sample).square().mean(dim=(1, 2, 3))
+                            v_noi, m_noi = torch.var_mean(noise)        # ori noise
+                            v_sam, m_sam = torch.var_mean(sample)
+                            v_nns, m_nns = torch.var_mean(new_noises)   # new noises
+                            v_dst, m_dst = torch.var_mean(dist_arr)     # distance
+                            msg = f"({m_sam:7.4f} {v_sam:7.4f}), ({m_noi:7.4f} {v_noi:7.4f}), " \
+                                  f"({m_nns:7.4f} {v_nns:7.4f}), ({m_dst:7.4f} {v_dst:7.4f})"
+                            if n == 0 and n_idx == 0:
+                                print(f"m_sample v_sample, m_noise v_noise, m_noise_arr v_noise_arr, m_dist v_dist")
+                            val, idx = torch.min(dist_arr, dim=0)
+                            denominator += 1
+                            if idx == 1:
+                                numerator += 1
+                                print(f"dist:{dist_arr[1]:.4f}, {msg}")
+                            else:
+                                print(f"dist:{dist_arr[1]:.4f} vs {dist_arr[idx]:.4f}, {msg}")
+                        print(f"n_iter:{n: 3d}/{opt.n_iter}. ns:{check_noise_dist}. {numerator}/{denominator}")
+                    # if
 
                     x_samples = model.decode_first_stage(samples)
                     x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+                    # if batch_size is 1, opt.f is 8, opt.H = opt.W = 512,
+                    # then shape:    [4,  64,  64]
+                    # sample    : [1, 4,  64,  64]
+                    # x_samples : [1, 3, 512, 512]
 
-                    for x_sample in x_samples:
-                        x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                        img = Image.fromarray(x_sample.astype(np.uint8))
-                        img = put_watermark(img, wm_encoder)
-                        img.save(os.path.join(sample_path, f"{base_count:05}.png"))
-                        base_count += 1
-                        sample_count += 1
+                    if not check_noise_dist:
+                        for x_sample in x_samples:
+                            x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                            img = Image.fromarray(x_sample.astype(np.uint8))
+                            img = put_watermark(img, wm_encoder)
+                            img.save(os.path.join(sample_path, f"{base_count:05}.png"))
+                            base_count += 1
+                            sample_count += 1
 
                     all_samples.append(x_samples)
+                # for prompt
+            # for n_iter
+            if check_noise_dist:
+                accu = float(numerator) / denominator
+                print(f"check_noise_dist:{check_noise_dist}. accu:{accu:.4f} = {numerator}/{denominator}")
 
-            # additionally, save as grid
-            grid = torch.stack(all_samples, 0)
-            grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-            grid = make_grid(grid, nrow=n_rows)
+            if not check_noise_dist:
+                # additionally, save as grid
+                grid = torch.stack(all_samples, 0)
+                grid = rearrange(grid, 'n b c h w -> (n b) c h w')
+                grid = make_grid(grid, nrow=n_rows)
 
-            # to image
-            grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-            grid = Image.fromarray(grid.astype(np.uint8))
-            grid = put_watermark(grid, wm_encoder)
-            grid.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-            grid_count += 1
+                # to image
+                grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
+                grid = Image.fromarray(grid.astype(np.uint8))
+                grid = put_watermark(grid, wm_encoder)
+                grid.save(os.path.join(out_dir, f'grid-{grid_count:04}.png'))
+                grid_count += 1
+    # with
 
-    print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
-          f" \nEnjoy.")
+    print(f"Your samples are ready and waiting for you here: \n{out_dir} \n \nEnjoy.")
 
 
 if __name__ == "__main__":
