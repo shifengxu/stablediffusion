@@ -415,6 +415,100 @@ def vanilla_vrg_gen(opt):
         # for
     # for img_idx
 
+def track_prediction_error(args):
+    """
+    track prediction error, on different timesteps and dimensions.
+    :return:
+    """
+    import time
+    from datasets import LatentDataset
+    from torch.utils.data import DataLoader
+    import utils
+
+    img_size = 256
+    args.W = args.H = img_size
+    b_sz = args.batch_size
+    data_dir = args.fid_input1  # re-use this arg
+    limit = b_sz
+    device = args.device
+    log_info(f"track_prediction_error()...")
+    log_info(f"  data_dir : {data_dir}")
+    log_info(f"  limit    : {limit}")
+    log_info(f"  b_sz     : {b_sz}")
+    log_info(f"  img_size : {img_size}")
+    log_info(f"  device   : {device}")
+    ds = LatentDataset(data_dir, limit)
+    dl = DataLoader(ds, batch_size=b_sz, shuffle=False, num_workers=4)
+    b_cnt = len(dl)
+    log_info(f"  data_cnt : {len(ds)}")
+    log_info(f"  b_cnt    : {b_cnt}")
+    model, sampler = get_model_and_sampler(args)
+    num_timesteps = model.num_timesteps
+    prompt = "A Bedroom with bright window"
+    log_info(f"  num_timesteps : {num_timesteps}")
+    log_info(f"  prompt        : {prompt}")
+    c  = model.get_learned_conditioning([prompt] * b_sz)
+    uc = model.get_learned_conditioning([""] * b_sz)
+    c_in = torch.cat([uc, c])
+    unconditional_guidance_scale = args.scale
+    # ts_list = list(range(num_timesteps))
+    # ts_list = list(range(0, 1000))
+    ts_list = [9, 99, 199, 299, 399, 499, 599, 699, 799, 899, 999]
+    ts_cnt = len(ts_list)
+    noise_cnt = args.n_samples
+    log_info(f"  ts_cnt      : {ts_cnt}")
+    log_info(f"  ts_list[:5] : {ts_list[:5]}")
+    log_info(f"  ts_list[-5:]: {ts_list[-5:]}")
+    log_info(f"  noise_cnt   : {noise_cnt}")
+    pred_total = b_cnt * noise_cnt * ts_cnt
+    pred_cnt = 0
+    log_info(f"  pred_cnt    : {pred_cnt}")
+    log_info(f"  pred_total  : {pred_total}")
+    time_start = time.time()
+    for b_idx, (ltt_batch, ltt_idx) in enumerate(dl):
+        ltt_batch = ltt_batch.to(device)
+        batch_size = len(ltt_batch)
+        for n_idx in range(noise_cnt):
+            noi_batch = torch.randn_like(ltt_batch, device=device)
+            for t_idx, t in enumerate(ts_list):
+                pred_cnt += 1
+                if pred_cnt % 50 == 0:
+                    elp, eta = utils.get_time_ttl_and_eta(time_start, pred_cnt, pred_total)
+                    ss = f"B{b_idx:2d}/{b_cnt} Noise{n_idx:04d}/{noise_cnt}"
+                    log_info(f"{ss} t[{t_idx:03d}/{ts_cnt}]:{t:3d}. elp:{elp}, eta:{eta}")
+                ts = torch.full((batch_size,), t, device=device)
+                ab_t = model.alphas_cumprod.index_select(0, ts).view(-1, 1, 1, 1)  # alpha_bar_t
+                noisy_x_t = ltt_batch * ab_t.sqrt() + noi_batch * (1.0 - ab_t).sqrt()
+                x_in = torch.cat([noisy_x_t] * 2)
+                t_in = torch.cat([ts] * 2)
+                with torch.no_grad(), autocast(args.device), model.ema_scope():
+                    model_uncond, model_t = model.apply_model(x_in, t_in, c_in).chunk(2)
+                    noi_pred = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
+                # with
+                save_pred_error(b_idx, n_idx, t, b_sz, noi_batch, noi_pred)
+            # for ts
+        # for noise
+    # for batch
+    log_info(f"track_prediction_error()...Done")
+
+def save_pred_error(b_idx, n_idx, t, b_sz, noi_batch, noi_pred):
+    dim_list = [0, 1, 1000, 1001, 2000, 2001, 3000, 3001, 4000, 4001]
+    gt_batch = noi_batch.view(b_sz, -1)
+    pd_batch = noi_pred.view(b_sz, -1)
+    ltt_init_id = b_idx * b_sz
+    for i, (gt, pd) in enumerate(zip(gt_batch, pd_batch)):
+        for dim in dim_list:
+            dir_str = f"./ltt{ltt_init_id+i:02d}/dim{dim:04d}/"
+            f_path = os.path.join(dir_str, f"ts{t:03d}.txt")
+            delta = pd[dim] - gt[dim]
+            if n_idx == 0:
+                os.makedirs(dir_str, exist_ok=True)
+                with open(f_path, "w") as f: f.write(f"{delta:11.8f}\n")
+            else:
+                with open(f_path, "a") as f: f.write(f"{delta:11.8f}\n")
+        # for
+    # for
+
 def main():
     opt = parse_args()
     seed_everything(opt.seed)
@@ -426,6 +520,8 @@ def main():
         sampler.sample_compare_all()
     if opt.todo == 'vanilla_vrg_gen':
         vanilla_vrg_gen(opt)
+    elif opt.todo == 'track_pred_error':
+        track_prediction_error(opt)
     else:
         instance_gen_compare(opt)
 

@@ -213,3 +213,36 @@ class LatentPrompt1to1Dataset(Dataset):
 
     def __len__(self):
         return len(self.fns_list)
+
+class LatentDataset(Dataset):
+    def __init__(self, data_dir, data_limit=0):
+        # data_dir is like: ./datasets_for_training/bedroom_train_ltt/
+        self.data_dir = data_dir
+        self.data_limit = data_limit
+        if not os.path.exists(data_dir):
+            raise ValueError(f"Path not exist: {data_dir}")
+        if not os.path.isdir(data_dir):
+            raise ValueError(f"Path not dir: {data_dir}")
+        fn_list = os.listdir(data_dir)  # file name list: ['00001.npy', '00002.npy', '00003.npy']
+        fn_list.sort()
+        log_info(f"LatentPrompt1to1Dataset()...")
+        log_info(f"  data_dir   : {data_dir}")
+        log_info(f"  file cnt   : {len(fn_list)}")
+        log_info(f"  file[0]    : {fn_list[0]}")
+        log_info(f"  file[-1]   : {fn_list[-1]}")
+        log_info(f"  data_limit : {data_limit}")
+        if data_limit > 0:
+            fn_list = fn_list[:data_limit]
+        log_info(f"  train      : {len(fn_list)}")
+        log_info(f"  train[0]   : {fn_list[0]}")
+        log_info(f"  train[-1]  : {fn_list[-1]}")
+        self.fn_list = fn_list
+        log_info(f"LatentPrompt1to1Dataset()...Done")
+
+    def __getitem__(self, index):
+        fn = self.fn_list[index] # file name step is like: '00001', '00002', '00003'
+        ltt = np.load(os.path.join(self.data_dir, fn))
+        return ltt, index
+
+    def __len__(self):
+        return len(self.fn_list)
